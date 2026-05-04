@@ -13,6 +13,7 @@
   "files": [
     ".pi/",
     "README.md",
+    "ROADMAP.md",
     "LICENSE"
   ],
   "pi": {
