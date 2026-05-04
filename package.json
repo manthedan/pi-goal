@@ -27,6 +27,7 @@
   },
   "scripts": {
     "check": "pi --no-extensions -e ./.pi/extensions/pi-goal/index.ts --list-models __pi_goal_load_check__",
+    "test": "node --test tests/*.test.mjs",
     "pack:dry": "npm pack --dry-run"
   },
   "author": "michaelliv",
