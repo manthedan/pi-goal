@@ -80,6 +80,17 @@ The model is instructed to audit completion against real evidence before calling
 
 Goal state is stored as Pi custom session entries with `customType: "pi-goal"`. It follows the active session branch, survives reloads, and does not require an external database.
 
+## Development
+
+Run the extension load check and package tests before publishing changes:
+
+```bash
+npm run check
+npm test
+```
+
+`npm test` verifies the package manifest, documented goal controls, roadmap coverage, and that the extension loads through Pi.
+
 ## License
 
 MIT
