@@ -76,6 +76,7 @@ type SessionRuntime = {
 	currentTurnFileTouched: boolean;
 	recentActions: string[];
 	noFileChangeTurns: number;
+	statusBarEnabled: boolean;
 	lastCtx?: ExtensionContext;
 };
 
@@ -107,6 +108,7 @@ function runtimeFor(ctx: ExtensionContext): SessionRuntime {
 			currentTurnFileTouched: false,
 			recentActions: [],
 			noFileChangeTurns: 0,
+			statusBarEnabled: true,
 		};
 		runtimes.set(key, runtime);
 	}
@@ -267,22 +269,48 @@ function emitGoalEvent(
 	);
 }
 
-function latestGoalFromSession(ctx: ExtensionContext): GoalState | null {
+function latestStateFromSession(ctx: ExtensionContext): { goal: GoalState | null; statusBarEnabled: boolean } {
 	const entries = ctx.sessionManager.getBranch?.() ?? ctx.sessionManager.getEntries();
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i] as any;
 		if (entry.type === "custom" && entry.customType === CUSTOM_TYPE) {
-			return normalizeGoal(entry.data?.goal ?? null);
+			return {
+				goal: normalizeGoal(entry.data?.goal ?? null),
+				statusBarEnabled: entry.data?.statusBarEnabled ?? true,
+			};
 		}
 	}
-	return null;
+	return { goal: null, statusBarEnabled: true };
+}
+
+function updateStatusBar(ctx: ExtensionContext, runtime: SessionRuntime) {
+	ctx.ui.setStatus(CUSTOM_TYPE, runtime.statusBarEnabled ? statusLine(runtime.goal) ?? "" : "");
+}
+
+const GOAL_TOOL_NAMES = ["get_goal", "update_goal"];
+
+// Expose goal tools to the LLM only while a goal is actively being pursued.
+// When no goal exists (or it is paused / complete / budget-limited), keep them
+// hidden so unrelated sessions are not tempted to call them every turn.
+function syncGoalTools(pi: ExtensionAPI, runtime: SessionRuntime) {
+	const want = runtime.goal?.status === "active";
+	const active = new Set(pi.getActiveTools());
+	for (const name of GOAL_TOOL_NAMES) (want ? active.add(name) : active.delete(name));
+	pi.setActiveTools(Array.from(active));
 }
 
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	const runtime = runtimeFor(ctx);
 	runtime.goal = next;
-	pi.appendEntry(CUSTOM_TYPE, { goal: next });
-	ctx.ui.setStatus(CUSTOM_TYPE, statusLine(next) ?? "");
+	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled: runtime.statusBarEnabled });
+	updateStatusBar(ctx, runtime);
+	syncGoalTools(pi, runtime);
+}
+
+function persistSettings(pi: ExtensionAPI, ctx: ExtensionContext) {
+	const runtime = runtimeFor(ctx);
+	pi.appendEntry(CUSTOM_TYPE, { goal: runtime.goal, statusBarEnabled: runtime.statusBarEnabled });
+	updateStatusBar(ctx, runtime);
 }
 
 function addEvidence(pi: ExtensionAPI, ctx: ExtensionContext, evidence: GoalEvidence) {
@@ -501,8 +529,15 @@ export default function piGoal(pi: ExtensionAPI) {
 		name: "get_goal",
 		label: "Get Goal",
 		description: "Read the current active thread goal, if one exists.",
-		promptSnippet: "Read the current thread goal and budget state",
-		parameters: { type: "object", properties: {}, additionalProperties: false } as any,
+		promptSnippet: "Read the current pi-goal objective and remaining budget while pursuing it",
+		promptGuidelines: [
+			"Only call get_goal when you actually need the current objective or remaining budget; the continuation prompt already injects them.",
+		],
+		parameters: {
+			type: "object",
+			properties: {},
+			additionalProperties: false,
+		} as any,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const goal = runtimeFor(ctx).goal;
 			return { content: [{ type: "text", text: JSON.stringify({ goal }, null, 2) }], details: { goal } };
@@ -565,9 +600,9 @@ export default function piGoal(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("goal", {
-		description: "Set, view, pause, resume, clear, export, or import a long-running goal",
+		description: "Set, view, pause, resume, clear, export, import, or configure a long-running goal",
 		getArgumentCompletions: (prefix) => {
-			const values = ["pause", "resume", "clear", "status", "export", "import"];
+			const values = ["pause", "resume", "clear", "status", "export", "import", "statusbar", "statusbar on", "statusbar off"];
 			const filtered = values.filter((value) => value.startsWith(prefix));
 			return filtered.length ? filtered.map((value) => ({ value, label: value })) : null;
 		},
@@ -578,7 +613,18 @@ export default function piGoal(pi: ExtensionAPI) {
 
 			if (!trimmed || trimmed === "status") {
 				if (!runtime.goal) ctx.ui.notify("Usage: /goal [--tokens 50k] [--max-turns 20] [--max-minutes 60] [--checkpoint 5] <objective>", "info");
-				else ctx.ui.notify(`${statusLine(runtime.goal)}\nObjective: ${runtime.goal.objective}\nEvidence entries: ${runtime.goal.evidenceLedger.length}`, "info");
+				else ctx.ui.notify(`${statusLine(runtime.goal)}
+Objective: ${runtime.goal.objective}
+Evidence entries: ${runtime.goal.evidenceLedger.length}
+Status bar: ${runtime.statusBarEnabled ? "on" : "off"}`, "info");
+				return;
+			}
+
+			if (trimmed === "statusbar" || trimmed === "statusbar toggle" || trimmed === "statusbar on" || trimmed === "statusbar off") {
+				const [, value] = trimmed.split(/\s+/, 2);
+				runtime.statusBarEnabled = value === "on" ? true : value === "off" ? false : !runtime.statusBarEnabled;
+				persistSettings(pi, ctx);
+				ctx.ui.notify(`Goal status bar ${runtime.statusBarEnabled ? "enabled" : "disabled"}.`, "info");
 				return;
 			}
 
@@ -658,20 +704,28 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		const runtime = runtimeFor(ctx);
-		runtime.goal = latestGoalFromSession(ctx);
+		const restored = latestStateFromSession(ctx);
+		runtime.goal = restored.goal;
+		runtime.statusBarEnabled = restored.statusBarEnabled;
 		runtime.pendingControlPrompt = null;
 		runtime.continuationQueued = false;
 		runtime.activeTurnStartedAt = null;
 		runtime.currentTurnToolCalls = [];
 		runtime.currentTurnFileTouched = false;
+		runtime.recentActions = [];
+		runtime.noFileChangeTurns = 0;
+		// Hide goal tools from the LLM unless we have an active goal to pursue.
+		syncGoalTools(pi, runtime);
 		if (runtime.goal?.status === "active" && event.reason === "reload") {
 			runtime.goal = { ...runtime.goal, status: "paused", updatedAt: Date.now() };
 			persist(pi, ctx, runtime.goal);
-			emitGoalEvent(pi, "paused", runtime.goal, `Ⅱ goal paused after reload: ${truncateObjective(runtime.goal.objective)}\nUse /goal resume to continue, or /goal clear to stop.`);
+			emitGoalEvent(pi, "paused", runtime.goal, `Ⅱ goal paused after reload: ${truncateObjective(runtime.goal.objective)}
+Use /goal resume to continue, or /goal clear to stop.`);
 			return;
 		}
-		ctx.ui.setStatus(CUSTOM_TYPE, statusLine(runtime.goal) ?? "");
-		if (runtime.goal?.status === "active") emitGoalEvent(pi, "active", runtime.goal, `⚑ goal restored: ${truncateObjective(runtime.goal.objective)}\nUse /goal pause to stop continuation, or /goal clear to remove it.`);
+		updateStatusBar(ctx, runtime);
+		if (runtime.goal?.status === "active") emitGoalEvent(pi, "active", runtime.goal, `⚑ goal restored: ${truncateObjective(runtime.goal.objective)}
+Use /goal pause to stop continuation, or /goal clear to remove it.`);
 	});
 
 	pi.on("turn_start", (_event, ctx) => {

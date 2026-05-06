@@ -1,5 +1,7 @@
 # pi-goal
 
+![pi-goal](docs/assets/pi-goal-poster.png)
+
 Persistent autonomous goals for [pi](https://github.com/badlogic/pi-mono).
 
 `pi-goal` adds a `/goal` command and goal tools so Pi can keep working toward a long-running objective until the goal is complete, paused, cleared, or token-budget-limited.
@@ -28,6 +30,7 @@ pi install git:github.com/manthedan/pi-goal
 /goal clear
 /goal export [file]
 /goal import <file>
+/goal statusbar off
 ```
 
 When a goal is active, the extension shows compact visible lifecycle markers like `Goal active` and `Goal continuing`; expand them with `ctrl+o` to inspect the objective and usage. The actual continuation instructions are injected into the next turn's system prompt, so the full prompt does not clutter the transcript.
@@ -43,6 +46,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 - `/goal clear`: remove the goal
 - `/goal export [file]`: export the objective, progress, and evidence ledger to Markdown
 - `/goal import <file>`: import a Markdown or JSON goal export as a paused goal
+- `/goal statusbar on|off`: show or hide the footer status line
 - `get_goal` tool: read current goal state
 - `update_goal` tool: model can only mark the goal `complete`
 - footer status with compact progress: turns, tokens/time, limits, and last action
