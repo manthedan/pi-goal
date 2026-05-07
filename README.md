@@ -33,7 +33,7 @@ pi install git:github.com/manthedan/pi-goal
 /goal statusbar off
 ```
 
-When a goal is active, the extension shows compact visible lifecycle markers like `Goal active` and `Goal continuing`; expand them with `ctrl+o` to inspect the objective and usage. The actual continuation instructions are injected into the next turn's system prompt, so the full prompt does not clutter the transcript.
+When a goal is active, the extension shows compact visible lifecycle markers like `Goal active` and `Goal continuing`; expand them with `ctrl+o` to inspect the objective and usage. The full continuation instructions ride along as the content of that custom message, so the model always has the objective and audit guidance in the transcript while the renderer keeps the visible UI compact.
 
 The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, the user pauses/clears it, or the token budget is reached. Reloading Pi pauses an active goal instead of silently resuming it; use `/goal resume` to continue.
 
@@ -57,7 +57,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 /goal <objective>
   -> persist goal in the current Pi session
   -> show compact Goal marker and footer status
-  -> inject hidden continuation instructions into the next system prompt
+  -> deliver continuation instructions as the marker's message content
   -> trigger an agent turn
   -> account time/tokens on turn_end
   -> queue another continuation on agent_end while active

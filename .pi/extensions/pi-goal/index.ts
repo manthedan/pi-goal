@@ -250,6 +250,33 @@ function goalEventStatus(kind: GoalEventKind): string {
 	return labels[kind];
 }
 
+function goalContentForLLM(kind: GoalEventKind, state: GoalState | null, fallback?: string): string {
+	if (!state) return fallback ?? `Goal ${goalEventStatus(kind)}.`;
+	switch (kind) {
+		case "active":
+		case "continuation":
+		case "resumed":
+			return continuationPrompt(state);
+		case "budget_limited":
+			return budgetLimitPrompt(state);
+		case "paused":
+			return `The active goal has been paused by the user. Stop pursuing it for now and wait for further instructions.\n\nObjective: ${state.objective}`;
+		case "cleared":
+			return `The active goal has been cleared by the user. Stop pursuing it.\n\nObjective was: ${state.objective}`;
+		case "complete":
+			return `The goal has been marked complete.\n\nObjective: ${state.objective}\nUsage: ${goalUsage(state)}`;
+		case "budget_warning":
+		case "checkpoint":
+		case "anti_thrash":
+		case "exported":
+		case "imported":
+			return fallback ?? `Goal ${goalEventStatus(kind)}.\n\nObjective: ${state.objective}\nUsage: ${goalUsage(state)}`;
+	}
+}
+
+// Emit a goal event into the conversation. The LLM-visible content is always
+// actionable text derived from kind + state, so continuation does not depend on
+// hidden system-prompt injection.
 function emitGoalEvent(
 	pi: ExtensionAPI,
 	kind: GoalEventKind,
@@ -257,13 +284,12 @@ function emitGoalEvent(
 	content?: string,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) {
-	const text = content ?? `Goal ${goalEventStatus(kind)} (ctrl+o to expand)`;
 	pi.sendMessage(
 		{
 			customType: EVENT_TYPE,
-			content: text,
+			content: goalContentForLLM(kind, state, content),
 			display: true,
-			details: { kind, goal: state, timestamp: Date.now() },
+			details: { kind, goal: state, timestamp: Date.now(), preview: content },
 		},
 		options,
 	);
@@ -418,7 +444,6 @@ function queueContinuation(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalS
 		runtime.continuationQueued = false;
 		const latest = runtime.goal;
 		if (!latest || !canQueueContinuation(runtime, ctx, latest)) return;
-		runtime.pendingControlPrompt = { goalId: latest.id, prompt: continuationPrompt(latest), kind: "continuation", createdAt: Date.now() };
 		emitGoalEvent(pi, "continuation", latest, undefined, { triggerTurn: true, deliverAs: "followUp" });
 	}, 0);
 }
@@ -512,17 +537,6 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 		box.addChild(new Text(lines.join("\n"), 0, 0));
 		return box;
-	});
-
-	pi.on("before_agent_start", (event, ctx) => {
-		const runtime = runtimeFor(ctx);
-		const pending = runtime.pendingControlPrompt;
-		runtime.pendingControlPrompt = null;
-		if (!pending) return;
-		const current = runtime.goal;
-		if (!current || current.id !== pending.goalId) return;
-		if (pending.kind === "continuation" && (current.status !== "active" || ctx.hasPendingMessages())) return;
-		return { systemPrompt: `${event.systemPrompt}\n\n${pending.prompt}` };
 	});
 
 	pi.registerTool({
@@ -695,10 +709,8 @@ Status bar: ${runtime.statusBarEnabled ? "on" : "off"}`, "info");
 				updatedAt: now,
 			};
 			persist(pi, ctx, next);
-			if (ctx.isIdle() && !ctx.hasPendingMessages()) {
-				runtime.pendingControlPrompt = { goalId: next.id, prompt: continuationPrompt(next), kind: "continuation", createdAt: now };
-				emitGoalEvent(pi, "active", next, undefined, { triggerTurn: true });
-			} else emitGoalEvent(pi, "active", next);
+			if (ctx.isIdle() && !ctx.hasPendingMessages()) emitGoalEvent(pi, "active", next, undefined, { triggerTurn: true });
+			else emitGoalEvent(pi, "active", next);
 		},
 	});
 
@@ -769,7 +781,6 @@ Use /goal pause to stop continuation, or /goal clear to remove it.`);
 
 		persist(pi, ctx, next);
 		if (next.status === "budget_limited") {
-			runtime.pendingControlPrompt = { goalId: next.id, prompt: budgetLimitPrompt(next), kind: "budget_limit", createdAt: Date.now() };
 			emitGoalEvent(pi, "budget_limited", next, undefined, { triggerTurn: true, deliverAs: "followUp" });
 		} else if (next.status === "paused" && next.stopReason?.startsWith("checkpoint")) {
 			emitGoalEvent(pi, "checkpoint", next, `Goal checkpoint reached after ${next.turnsUsed} turns. Review progress, then use /goal resume to continue.`);
