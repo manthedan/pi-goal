@@ -33,7 +33,7 @@ pi install git:github.com/manthedan/pi-goal
 /goal statusbar off
 ```
 
-When a goal is active, the extension shows compact visible lifecycle markers like `Goal active` and `Goal continuing`; expand them with `ctrl+o` to inspect the objective and usage. The full continuation instructions ride along as the content of that custom message, so the model always has the objective and audit guidance in the transcript while the renderer keeps the visible UI compact.
+When a goal is started/resumed/paused/etc., the extension shows compact visible lifecycle markers that can be expanded with `ctrl+o`. Automatic continuation turns are delivered as hidden follow-up messages, so the model still receives the objective and audit guidance without cluttering the visible transcript.
 
 The same Pi agent keeps running normal turns in the same session context until it calls `update_goal({ status: "complete" })`, the user pauses/clears it, or the token budget is reached. Reloading Pi pauses an active goal instead of silently resuming it; use `/goal resume` to continue.
 
@@ -58,7 +58,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 /goal <objective>
   -> persist goal in the current Pi session
   -> show compact Goal marker and footer status
-  -> deliver continuation instructions as the marker's message content
+  -> deliver continuation instructions as hidden follow-up message content
   -> trigger an agent turn
   -> account time/tokens on turn_end
   -> queue another continuation on agent_end while active
@@ -72,6 +72,10 @@ The model is instructed to audit completion against real evidence before calling
 ## Hardened fork additions
 
 - Safer continuation scheduling: continuations are rechecked against idle/pending state before prompt injection.
+- Hidden, marked continuation prompts with stale-goal checks, inspired by Codex-style hidden follow-ups.
+- Explicit superseded-continuation bookkeeping when queued work is replaced, cancelled, or stale.
+- Recovery handling for context-overflow/provider errors: one context retry, bounded transient retries with backoff, then pause with a clear reason.
+- More modular internals: state helpers, prompt construction, accounting/limit checks, recovery logic, and goal tool registration are split out from the main extension entrypoint.
 - Per-session runtime state keyed by session file/id instead of one module-global goal.
 - Hard stop controls: token budget, max turns, and max minutes.
 - Checkpoints: pause every N turns with `/goal --checkpoint N ...`.
