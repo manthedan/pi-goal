@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Box, Spacer, Text } from "@mariozechner/pi-tui";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import { tokenDeltaFromUsage } from "./usage";
 
 const CUSTOM_TYPE = "pi-goal";
 const EVENT_TYPE = "pi-goal-event";
@@ -215,12 +216,6 @@ function goalUsage(state: GoalState): string {
 	if (state.maxMinutes != null) items.push(`${formatElapsed(state.timeUsedSeconds)} / ${state.maxMinutes}m`);
 	if (state.checkpointEvery != null) items.push(`checkpoint every ${state.checkpointEvery} turns`);
 	return items.join(" · ");
-}
-
-function tokenDeltaFromUsage(usage: any): number {
-	if (!usage) return 0;
-	if (typeof usage.totalTokens === "number") return Math.max(0, usage.totalTokens);
-	return Math.max(0, (Number(usage.input) || 0) + (Number(usage.output) || 0));
 }
 
 function truncateText(value: unknown, max = 280): string {

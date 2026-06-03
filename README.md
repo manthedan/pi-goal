@@ -39,6 +39,7 @@ The same Pi agent keeps running normal turns in the same session context until i
 
 ## What it adds
 
+- `pi-goal-writer` skill: draft and review strong `/goal` objectives with evidence-based success criteria
 - `/goal [--tokens 50k] [--max-turns 20] [--max-minutes 60] [--checkpoint 5] <objective>`: set or replace a goal
 - `/goal status`: show the current goal
 - `/goal pause`: stop autonomous continuation without deleting the goal
