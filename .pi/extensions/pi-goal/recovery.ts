@@ -43,7 +43,7 @@ function isNonRetryableProviderLimitError(errorMessage: string): boolean {
 
 export function isRetryableTransientError(errorMessage: string | undefined): boolean {
 	if (!errorMessage || isContextOverflowError(errorMessage) || isNonRetryableProviderLimitError(errorMessage)) return false;
-	return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|fetch failed|upstream|socket hang up|stream ended|timed? out|timeout|terminated/i.test(errorMessage);
+	return /overloaded|provider.?returned.?error|no tool call found for function call output|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|fetch failed|upstream|socket hang up|stream ended|timed? out|timeout|terminated/i.test(errorMessage);
 }
 
 function normalizeSignature(errorMessage: string | undefined): string {

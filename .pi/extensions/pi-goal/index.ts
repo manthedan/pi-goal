@@ -89,6 +89,7 @@ type SessionRuntime = {
 	pendingControlPrompt: PendingControlPrompt | null;
 	pendingContextCompaction: PendingContextCompaction | null;
 	contextCompactionInFlight: boolean;
+	activeToolCallIds: Set<string>;
 	recovery: RecoveryState;
 	currentTurnToolCalls: string[];
 	currentTurnFileTouched: boolean;
@@ -122,6 +123,7 @@ function runtimeFor(ctx: ExtensionContext): SessionRuntime {
 			pendingControlPrompt: null,
 			pendingContextCompaction: null,
 			contextCompactionInFlight: false,
+			activeToolCallIds: new Set(),
 			recovery: createRecoveryState(),
 			currentTurnToolCalls: [],
 			currentTurnFileTouched: false,
@@ -327,6 +329,47 @@ function goalCompactionInstructions(state: GoalState): string {
 	].join("\n");
 }
 
+function toolCallIdAliases(id: unknown): string[] {
+	if (typeof id !== "string" || !id) return [];
+	const prefix = id.split("|", 1)[0];
+	return prefix && prefix !== id ? [id, prefix] : [id];
+}
+
+function rememberToolCallId(runtime: SessionRuntime, id: unknown) {
+	for (const alias of toolCallIdAliases(id)) runtime.activeToolCallIds.add(alias);
+}
+
+function forgetToolCallId(runtime: SessionRuntime, id: unknown) {
+	for (const alias of toolCallIdAliases(id)) runtime.activeToolCallIds.delete(alias);
+}
+
+function messageToolCallIds(message: any): string[] {
+	const ids: string[] = [];
+	for (const item of message?.content ?? []) {
+		if (item?.type !== "toolCall") continue;
+		ids.push(...toolCallIdAliases(item.id));
+	}
+	return ids;
+}
+
+function pruneOrphanToolResultsForContext(messages: any[]): any[] {
+	const seenToolCalls = new Set<string>();
+	const result: any[] = [];
+	for (const message of messages) {
+		if (message?.role === "assistant") {
+			for (const id of messageToolCallIds(message)) seenToolCalls.add(id);
+			result.push(message);
+			continue;
+		}
+		if (message?.role === "toolResult") {
+			const aliases = toolCallIdAliases(message.toolCallId);
+			if (aliases.length > 0 && !aliases.some((id) => seenToolCalls.has(id))) continue;
+		}
+		result.push(message);
+	}
+	return result;
+}
+
 // Emit a goal event into the conversation. The LLM-visible content is always
 // actionable text derived from kind + state, so continuation does not depend on
 // hidden system-prompt injection.
@@ -521,7 +564,7 @@ function runContextCompactionRetry(pi: ExtensionAPI, ctx: ExtensionContext, runt
 		return;
 	}
 	if (runtime.contextCompactionInFlight) return;
-	if (!ctx.isIdle() || ctx.signal) {
+	if (!ctx.isIdle() || ctx.signal || runtime.activeToolCallIds.size > 0) {
 		if (!runtime.retryTimer) {
 			runtime.retryTimer = setTimeout(() => {
 				runtime.retryTimer = null;
@@ -651,15 +694,15 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("context", (event, ctx) => {
 		const runtime = runtimeFor(ctx);
-		const messages = prunePiGoalMessagesForContext(event.messages as any[], runtime.goal);
+		const messages = pruneOrphanToolResultsForContext(prunePiGoalMessagesForContext(event.messages as any[], runtime.goal));
 		if (messages.length !== event.messages.length || messages.some((message, index) => message !== (event.messages as any[])[index])) return { messages };
 	});
 
 	pi.on("session_before_compact", (event, ctx) => {
 		const runtime = runtimeFor(ctx);
 		if (!runtime.goal) return;
-		event.preparation.messagesToSummarize = prunePiGoalMessagesForContext(event.preparation.messagesToSummarize as any[], runtime.goal, true) as any;
-		event.preparation.turnPrefixMessages = prunePiGoalMessagesForContext(event.preparation.turnPrefixMessages as any[], runtime.goal, true) as any;
+		event.preparation.messagesToSummarize = pruneOrphanToolResultsForContext(prunePiGoalMessagesForContext(event.preparation.messagesToSummarize as any[], runtime.goal, true)) as any;
+		event.preparation.turnPrefixMessages = pruneOrphanToolResultsForContext(prunePiGoalMessagesForContext(event.preparation.turnPrefixMessages as any[], runtime.goal, true)) as any;
 	});
 
 	pi.on("session_compact", (_event, ctx) => {
@@ -674,8 +717,17 @@ export default function piGoal(pi: ExtensionAPI) {
 		}
 	});
 
+	pi.on("tool_execution_start", (event, ctx) => {
+		rememberToolCallId(runtimeFor(ctx), (event as any).toolCallId);
+	});
+
+	pi.on("tool_execution_end", (event, ctx) => {
+		forgetToolCallId(runtimeFor(ctx), (event as any).toolCallId);
+	});
+
 	pi.on("tool_call", (event, ctx) => {
 		const runtime = runtimeFor(ctx);
+		rememberToolCallId(runtime, (event as any).toolCallId);
 		if (!runtime.goal || runtime.goal.status !== "active") return;
 		const input = (event as any).input ?? {};
 		const signature = `${(event as any).toolName}:${truncateText(input.command ?? input.path ?? JSON.stringify(input), 120)}`;
@@ -685,6 +737,7 @@ export default function piGoal(pi: ExtensionAPI) {
 
 	pi.on("tool_result", (event, ctx) => {
 		const runtime = runtimeFor(ctx);
+		forgetToolCallId(runtime, (event as any).toolCallId);
 		if (!runtime.goal || runtime.goal.status !== "active") return;
 		const toolName = String((event as any).toolName ?? "tool");
 		const input = (event as any).input ?? {};
@@ -809,6 +862,7 @@ Status bar: ${runtime.statusBarEnabled ? "on" : "off"}`, "info");
 		runtime.pendingControlPrompt = null;
 		runtime.pendingContextCompaction = null;
 		runtime.contextCompactionInFlight = false;
+		runtime.activeToolCallIds.clear();
 		cancelQueuedWork(pi, runtime, "session started");
 		runtime.continuationQueuedFor = null;
 		runtime.recovery = createRecoveryState();
