@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { repeatedActionDetected, shouldWarnForBudget, stopReason } from "./accounting";
 import { budgetLimitPrompt, continuationPrompt, supersededContinuationMessage } from "./prompts";
-import { createRecoveryState, planRecoveryForAssistantMessage, resetRecoveryState, type RecoveryState } from "./recovery";
+import { createRecoveryState, isContextOverflowError, planRecoveryForAssistantMessage, resetRecoveryState, type RecoveryState } from "./recovery";
 import { sessionKey } from "./state";
 import { GOAL_TOOL_NAMES, registerGoalTools } from "./tools";
 import { tokenDeltaFromUsage } from "./usage";
@@ -18,6 +18,7 @@ const MAX_EVIDENCE_ENTRIES = 80;
 const MAX_RECENT_ACTIONS = 12;
 const REPEATED_ACTION_LIMIT = 4;
 const NO_FILE_CHANGE_TURN_LIMIT = 5;
+const PROACTIVE_COMPACT_AT_PERCENT = 70;
 
 type GoalStatus = "active" | "paused" | "budget_limited" | "complete";
 
@@ -74,6 +75,11 @@ type PendingControlPrompt = {
 	createdAt: number;
 };
 
+type PendingContextCompaction = {
+	goalId: string;
+	reason: string;
+};
+
 type SessionRuntime = {
 	goal: GoalState | null;
 	activeTurnStartedAt: number | null;
@@ -81,6 +87,8 @@ type SessionRuntime = {
 	continuationTimer: ReturnType<typeof setTimeout> | null;
 	retryTimer: ReturnType<typeof setTimeout> | null;
 	pendingControlPrompt: PendingControlPrompt | null;
+	pendingContextCompaction: PendingContextCompaction | null;
+	contextCompactionInFlight: boolean;
 	recovery: RecoveryState;
 	currentTurnToolCalls: string[];
 	currentTurnFileTouched: boolean;
@@ -112,6 +120,8 @@ function runtimeFor(ctx: ExtensionContext): SessionRuntime {
 			continuationTimer: null,
 			retryTimer: null,
 			pendingControlPrompt: null,
+			pendingContextCompaction: null,
+			contextCompactionInFlight: false,
 			recovery: createRecoveryState(),
 			currentTurnToolCalls: [],
 			currentTurnFileTouched: false,
@@ -275,6 +285,48 @@ function goalContentForLLM(kind: GoalEventKind, state: GoalState | null, fallbac
 	}
 }
 
+const GOAL_CONTROL_CONTEXT_KINDS = new Set<GoalEventKind>(["active", "continuation", "resumed", "budget_limited"]);
+
+function isPiGoalCustomMessage(message: any): boolean {
+	return message?.role === "custom" && message?.customType === EVENT_TYPE;
+}
+
+function compactGoalControlMessage(state: GoalState): string {
+	const evidence = state.evidenceLedger.slice(-5).map((item) => `- [turn ${item.turn}] ${item.title}: ${item.summary}`).join("\n") || "- none yet";
+	return `Current pi-goal control state.\nObjective: ${state.objective}\nStatus: ${state.status}\nUsage: ${goalUsage(state)}\nLast action: ${state.lastAction ?? "none"}\nRecent evidence:\n${evidence}`;
+}
+
+function prunePiGoalMessagesForContext(messages: any[], currentGoal: GoalState | null, compactKept = false): any[] {
+	let keptLatestControl = false;
+	const result: any[] = [];
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (!isPiGoalCustomMessage(message)) {
+			result.push(message);
+			continue;
+		}
+		const details = message.details ?? {};
+		const kind = (details.kind ?? "continuation") as GoalEventKind;
+		const messageGoal = normalizeGoal(details.goal) ?? null;
+		if (details.superseded) continue;
+		if (currentGoal?.id && messageGoal?.id && messageGoal.id !== currentGoal.id) continue;
+		if (!GOAL_CONTROL_CONTEXT_KINDS.has(kind)) continue;
+		if (keptLatestControl) continue;
+		keptLatestControl = true;
+		result.push(compactKept && messageGoal ? { ...message, content: compactGoalControlMessage(messageGoal) } : message);
+	}
+	return result.reverse();
+}
+
+function goalCompactionInstructions(state: GoalState): string {
+	return [
+		"pi-goal compaction guidance:",
+		`- Preserve the current goal objective exactly enough to continue: ${truncateObjective(state.objective, 220)}`,
+		`- Preserve goal status, usage, last action, blockers, and the most important evidence from the ledger.`,
+		"- Do not copy repeated <pi_goal_continuation> prompts, superseded-continuation bookkeeping, or repeated completion-audit boilerplate; summarize them once if relevant.",
+	].join("\n");
+}
+
 // Emit a goal event into the conversation. The LLM-visible content is always
 // actionable text derived from kind + state, so continuation does not depend on
 // hidden system-prompt injection.
@@ -328,7 +380,11 @@ function syncGoalTools(pi: ExtensionAPI, runtime: SessionRuntime) {
 function persist(pi: ExtensionAPI, ctx: ExtensionContext, next: GoalState | null) {
 	const runtime = runtimeFor(ctx);
 	const previous = runtime.goal;
-	if (!next || next.status !== "active" || next.id !== previous?.id) cancelQueuedWork(pi, runtime, "goal state changed");
+	if (!next || next.status !== "active" || next.id !== previous?.id) {
+		cancelQueuedWork(pi, runtime, "goal state changed");
+		runtime.pendingContextCompaction = null;
+		if (!runtime.contextCompactionInFlight) runtime.recovery.pendingReason = null;
+	}
 	if (next?.status === "active" && (previous?.id !== next.id || previous.status !== "active")) resetRecoveryState(runtime.recovery);
 	runtime.goal = next;
 	pi.appendEntry(CUSTOM_TYPE, { goal: next, statusBarEnabled: runtime.statusBarEnabled });
@@ -407,6 +463,11 @@ function cancelQueuedWork(pi: ExtensionAPI, runtime: SessionRuntime, reason: str
 function queueContinuation(pi: ExtensionAPI, ctx: ExtensionContext, state: GoalState, delayMs = 0) {
 	const runtime = runtimeFor(ctx);
 	if (!canQueueContinuation(runtime, ctx, state)) return;
+	const usage = delayMs === 0 ? ctx.getContextUsage() : undefined;
+	if (usage?.percent != null && usage.percent >= PROACTIVE_COMPACT_AT_PERCENT) {
+		scheduleContextCompactionRetry(pi, ctx, state, `context usage ${Math.round(usage.percent)}%; compacting before next goal turn`);
+		return;
+	}
 	if (runtime.continuationQueuedFor) markQueuedContinuationSuperseded(pi, runtime, "newer continuation queued");
 	clearContinuationTimer(runtime);
 	runtime.continuationQueuedFor = state.id;
@@ -438,11 +499,73 @@ function scheduleRecoveryRetry(pi: ExtensionAPI, ctx: ExtensionContext, goal: Go
 	runtime.retryTimer.unref?.();
 }
 
+function scheduleContextCompactionRetry(pi: ExtensionAPI, ctx: ExtensionContext, goal: GoalState, reason: string) {
+	const runtime = runtimeFor(ctx);
+	cancelQueuedWork(pi, runtime, `context compaction scheduled: ${reason}`);
+	runtime.recovery.pendingReason = reason;
+	runtime.pendingContextCompaction = { goalId: goal.id, reason };
+	if (runtime.contextCompactionInFlight) return;
+	if (!ctx.isIdle() || ctx.signal) {
+		emitGoalEvent(pi, "recovery", goal, `Goal recovery pending: ${reason}. Will compact context as soon as the current agent run settles, then resume.`);
+		return;
+	}
+	runContextCompactionRetry(pi, ctx, runtime);
+}
+
+function runContextCompactionRetry(pi: ExtensionAPI, ctx: ExtensionContext, runtime: SessionRuntime) {
+	const pending = runtime.pendingContextCompaction;
+	const goal = runtime.goal;
+	if (!pending || !goal || goal.id !== pending.goalId || goal.status !== "active") {
+		runtime.pendingContextCompaction = null;
+		runtime.recovery.pendingReason = null;
+		return;
+	}
+	if (runtime.contextCompactionInFlight) return;
+	if (!ctx.isIdle() || ctx.signal) {
+		if (!runtime.retryTimer) {
+			runtime.retryTimer = setTimeout(() => {
+				runtime.retryTimer = null;
+				runContextCompactionRetry(pi, ctx, runtime);
+			}, 250);
+			runtime.retryTimer.unref?.();
+		}
+		return;
+	}
+	runtime.contextCompactionInFlight = true;
+	emitGoalEvent(pi, "recovery", goal, `Goal recovery pending: ${pending.reason}. Compacting context now; goal will resume afterward.`);
+	ctx.compact({
+		customInstructions: goalCompactionInstructions(goal),
+		onComplete: () => {
+			runtime.contextCompactionInFlight = false;
+			runtime.pendingContextCompaction = null;
+			const latest = runtime.goal;
+			runtime.recovery.pendingReason = null;
+			if (!latest || latest.id !== pending.goalId || latest.status !== "active") return;
+			emitGoalEvent(pi, "recovery", latest, "Context compaction complete; resuming goal continuation.");
+			queueContinuation(pi, ctx, latest, 250);
+		},
+		onError: (error) => {
+			runtime.contextCompactionInFlight = false;
+			runtime.pendingContextCompaction = null;
+			const latest = runtime.goal;
+			runtime.recovery.pendingReason = null;
+			if (!latest || latest.id !== pending.goalId || latest.status !== "active") return;
+			const next = { ...latest, status: "paused" as GoalStatus, stopReason: `context compaction failed: ${truncateText(error.message, 160)}`, updatedAt: Date.now() };
+			persist(pi, ctx, next);
+			emitGoalEvent(pi, "recovery", next, `Goal paused because context compaction failed: ${error.message}`);
+		},
+	});
+}
+
 function applyRecoveryPlan(pi: ExtensionAPI, ctx: ExtensionContext, goal: GoalState, message: any): boolean {
 	const runtime = runtimeFor(ctx);
 	const plan = planRecoveryForAssistantMessage(runtime.recovery, message);
 	if (plan.type === "none") return false;
 	if (plan.type === "retry") {
+		if (isContextOverflowError(String(message?.errorMessage ?? ""))) {
+			scheduleContextCompactionRetry(pi, ctx, goal, plan.reason);
+			return true;
+		}
 		scheduleRecoveryRetry(pi, ctx, goal, plan.reason, plan.delayMs);
 		emitGoalEvent(pi, "recovery", goal, `Goal recovery pending: ${plan.reason}. Retrying in ${Math.round(plan.delayMs / 1000)}s.`);
 		return true;
@@ -524,6 +647,31 @@ export default function piGoal(pi: ExtensionAPI) {
 		runtimeFor,
 		persist,
 		emitComplete: (goal) => emitGoalEvent(pi, "complete", goal),
+	});
+
+	pi.on("context", (event, ctx) => {
+		const runtime = runtimeFor(ctx);
+		const messages = prunePiGoalMessagesForContext(event.messages as any[], runtime.goal);
+		if (messages.length !== event.messages.length || messages.some((message, index) => message !== (event.messages as any[])[index])) return { messages };
+	});
+
+	pi.on("session_before_compact", (event, ctx) => {
+		const runtime = runtimeFor(ctx);
+		if (!runtime.goal) return;
+		event.preparation.messagesToSummarize = prunePiGoalMessagesForContext(event.preparation.messagesToSummarize as any[], runtime.goal, true) as any;
+		event.preparation.turnPrefixMessages = prunePiGoalMessagesForContext(event.preparation.turnPrefixMessages as any[], runtime.goal, true) as any;
+	});
+
+	pi.on("session_compact", (_event, ctx) => {
+		const runtime = runtimeFor(ctx);
+		const goal = runtime.goal;
+		if (!goal || goal.status !== "active") return;
+		if (runtime.contextCompactionInFlight) return;
+		if (runtime.pendingContextCompaction) return;
+		if (runtime.recovery.pendingReason?.includes("context")) {
+			runtime.recovery.pendingReason = null;
+			queueContinuation(pi, ctx, goal, 250);
+		}
 	});
 
 	pi.on("tool_call", (event, ctx) => {
@@ -659,6 +807,8 @@ Status bar: ${runtime.statusBarEnabled ? "on" : "off"}`, "info");
 		runtime.goal = restored.goal;
 		runtime.statusBarEnabled = restored.statusBarEnabled;
 		runtime.pendingControlPrompt = null;
+		runtime.pendingContextCompaction = null;
+		runtime.contextCompactionInFlight = false;
 		cancelQueuedWork(pi, runtime, "session started");
 		runtime.continuationQueuedFor = null;
 		runtime.recovery = createRecoveryState();
@@ -734,7 +884,12 @@ Use /goal pause to stop continuation, or /goal clear to remove it.`);
 	pi.on("agent_end", (_event, ctx) => {
 		const runtime = runtimeFor(ctx);
 		const currentGoal = runtime.goal;
-		if (!currentGoal || currentGoal.status !== "active" || runtime.recovery.pendingReason || ctx.hasPendingMessages()) return;
+		if (!currentGoal || currentGoal.status !== "active") return;
+		if (runtime.pendingContextCompaction) {
+			setTimeout(() => runContextCompactionRetry(pi, ctx, runtime), 0);
+			return;
+		}
+		if (runtime.recovery.pendingReason || ctx.hasPendingMessages()) return;
 		const stuckReason = repeatedActionDetected(runtime, REPEATED_ACTION_LIMIT, NO_FILE_CHANGE_TURN_LIMIT);
 		if (stuckReason) {
 			const next = { ...currentGoal, status: "paused" as GoalStatus, stopReason: stuckReason, updatedAt: Date.now() };

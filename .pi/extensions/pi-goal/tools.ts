@@ -42,6 +42,7 @@ export function registerGoalTools<Goal extends ToolGoal>(pi: ExtensionAPI, deps:
 		promptSnippet: "Mark the current goal complete after a strict completion audit",
 		promptGuidelines: [
 			"Use update_goal only when the current pi-goal objective is fully achieved and verified against concrete evidence.",
+			"Before marking complete, map every explicit requirement to real artifacts such as files, command output, tests, PR state, or verifier results; uncertainty means continue working.",
 			"Do not use update_goal to pause, resume, abandon, or budget-limit a goal.",
 		],
 		parameters: {
